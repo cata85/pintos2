@@ -100,6 +100,22 @@ struct thread
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
+
+    // list to hold the locks acquired by the thread
+    struct list lock_list;
+
+    // list to hold the files of the thread
+    struct list file_list;
+    // current file descriptor
+    int file_index;
+    // list of child processes
+    struct list child_list;
+    // thread id for parent process
+    tid_t parent;
+    // pointer to a child process
+    struct child_process* cp;
+    // for denying writes to executables
+    struct file* exec_file;
   };
 
 /* If false (default), use round-robin scheduler.
@@ -137,5 +153,9 @@ int thread_get_nice (void);
 void thread_set_nice (int);
 int thread_get_recent_cpu (void);
 int thread_get_load_avg (void);
+
+bool is_process_alive (int pid);
+
+void release_locks(void);
 
 #endif /* threads/thread.h */

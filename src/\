@@ -18,6 +18,16 @@
 #define USER_VADDR_BOTTOM ((void *) 0x08048000)
 
 
+// struct lock filesys_lock;
+
+struct process_file{
+  struct file *file;
+  int fd;
+  struct list_elem elem;
+};
+
+int process_add_file(struct file *f);
+struct file* process_get_file(int fd);
 static void syscall_handler(struct intr_frame*);
 int user_to_kernel_ptr(const void *vaddr);
 void get_arg (struct intr_frame *f, int *arg, int n);
@@ -26,18 +36,18 @@ void check_valid_buffer (void *buffer, unsigned size);
 void check_valid_string (const void *str);
 
 void
-syscall_init (void)
+syscall_init (void) 
 {
-  lock_init(&sys_file_lock);
+  lock_init(&filesys_lock);
   intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
 }
 
 static void
-syscall_handler (struct intr_frame *f UNUSED)
+syscall_handler (struct intr_frame *f UNUSED) 
 {
   int arg[MAX_ARGS];
   int esp = user_to_kernel_ptr((const void*) f->esp);
-
+  
   switch (* (int *) esp)
   {
     case SYS_HALT:
@@ -62,7 +72,7 @@ syscall_handler (struct intr_frame *f UNUSED)
     case SYS_WAIT:
     {
       get_arg(f, &arg[0], 1);
-      f->eax = process_wait(arg[0]);
+      f->eax = wait(arg[0]);
       break;
     }
     case SYS_CREATE:
@@ -132,18 +142,16 @@ syscall_handler (struct intr_frame *f UNUSED)
   }
 }
 
-// Shuts down and powers off.
 void halt (void)
 {
   shutdown_power_off();
 }
 
-// Terminates the current user program and returns the status to the kernel.
 void exit(int status)
 {
   struct thread *cur = thread_current();
 
-  if (is_process_alive(cur->parent) && cur->cp)
+  if (thread_alive(cur->parent) && cur->cp)
   {
     cur->cp->status = status;
   }
@@ -152,21 +160,20 @@ void exit(int status)
   thread_exit();
 }
 
-// Runs the executable from the name given from the command line.
 pid_t exec(const char *cmd_line)
 {
   pid_t pid = process_execute(cmd_line);
   struct child_process *cp = get_child_process(pid);
-
+  
   if(!cp)
   {
     return ERROR;
   }
-  if(cp->load_status == NOT_LOADED)
+  if(cp->load == NOT_LOADED)
   {
-    sema_down(&cp->load_status_sema);
+    sema_down(&cp->load_sema);
   }
-  if(cp->load_status == LOAD_FAIL)
+  if(cp->load == LOAD_FAIL)
   {
     remove_child_process(cp);
     return ERROR;
@@ -174,63 +181,64 @@ pid_t exec(const char *cmd_line)
   return pid;
 }
 
-// Creates a new file of size initial_size.
+int wait(pid_t pid)
+{
+  return process_wait(pid);
+}
+
 bool create(const char *file, unsigned initial_size)
 {
-  lock_acquire(&sys_file_lock);
+  lock_acquire(&filesys_lock);
   bool success = filesys_create(file, initial_size);
-  lock_release(&sys_file_lock);
+  lock_release(&filesys_lock);
   return success;
 }
 
-// Deletes a given file.
 bool remove(const char *file)
 {
-  lock_acquire(&sys_file_lock);
+  lock_acquire(&filesys_lock);
   bool success = filesys_remove(file);
-  lock_release(&sys_file_lock);
+  lock_release(&filesys_lock);
   return success;
 }
 
-// Opens a given file.
 int open(const char *file)
 {
-  lock_acquire(&sys_file_lock);
+  lock_acquire(&filesys_lock);
   struct file *f = filesys_open(file);
 
   if (!f)
   {
-    lock_release(&sys_file_lock);
+    lock_release(&filesys_lock);
     return ERROR;
   }
-  int file_index = process_add_file(f);
-  lock_release(&sys_file_lock);
-  return file_index;
+  int fd = process_add_file(f);
+  lock_release(&filesys_lock);
+  return fd;
 }
 
-// Returns the filesize of an open file 'file_index'.
-int filesize(int file_index)
-{
-  lock_acquire(&sys_file_lock);
 
-  struct file *f = process_get_file(file_index);
+int filesize(int fd)
+{
+  lock_acquire(&filesys_lock);
+
+  struct file *f = process_get_file(fd);
 
   if (!f)
   {
-    lock_release(&sys_file_lock);
+    lock_release(&filesys_lock);
     return ERROR;
   }
 
   int size = file_length(f);
-  lock_release(&sys_file_lock);
+  lock_release(&filesys_lock);
 
   return size;
 }
 
-// Reads the open file into the buffer.
-int read(int file_index, void *buffer, unsigned size)
+int read(int fd, void *buffer, unsigned size)
 {
-  if (file_index == STDIN_FILENO)
+  if (fd == STDIN_FILENO)
   {
     unsigned i;
     uint8_t* local_buffer = (uint8_t *) buffer;
@@ -240,93 +248,97 @@ int read(int file_index, void *buffer, unsigned size)
     }
     return size;
   }
-  lock_acquire(&sys_file_lock);
-  struct file *f = process_get_file(file_index);
+  lock_acquire(&filesys_lock);
+  struct file *f = process_get_file(fd);
   if (!f)
   {
-    lock_release(&sys_file_lock);
+    lock_release(&filesys_lock);
     return ERROR;
   }
 
   int bytes = file_read(f, buffer, size);
-  lock_release(&sys_file_lock);
+  lock_release(&filesys_lock);
 
   return bytes;
 }
 
-// Writes size size from buffer to the open file.
-int write(int file_index, const void *buffer, unsigned size)
+
+int write(int fd, const void *buffer, unsigned size)
 {
-  if (file_index == STDOUT_FILENO)
+  if (fd == STDOUT_FILENO)
   {
     putbuf(buffer, size);
     return size;
   }
-  lock_acquire(&sys_file_lock);
-  struct file* f = process_get_file(file_index);
+  lock_acquire(&filesys_lock);
+  struct file* f = process_get_file(fd);
   if (!f)
   {
-    lock_release(&sys_file_lock);
+    lock_release(&filesys_lock);
     return ERROR;
   }
 
   int bytes = file_write(f, buffer, size);
-  lock_release(&sys_file_lock);
+  lock_release(&filesys_lock);
   return bytes;
 }
 
-// Goes to the byte in an open file that you want to read or write to.
-void seek(int file_index, unsigned position)
+
+void seek(int fd, unsigned position)
 {
-  lock_acquire(&sys_file_lock);
-  struct file *f = process_get_file(file_index);
+  lock_acquire(&filesys_lock);
+  struct file *f = process_get_file(fd);
   if (!f)
   {
-    lock_release(&sys_file_lock);
+    lock_release(&filesys_lock);
     return ERROR;
   }
 
   file_seek(f, position);
-  lock_release(&sys_file_lock);
+  lock_release(&filesys_lock);
 }
 
-// Gives the position of the next byte to be read or wrote to in the open file.
-unsigned tell(int file_index)
-{
-  lock_acquire(&sys_file_lock);
 
-  struct file *f = process_get_file(file_index);
+unsigned tell(int fd)
+{
+  lock_acquire(&filesys_lock);
+
+  struct file *f = process_get_file(fd);
   if (!f)
   {
-    lock_release(&sys_file_lock);
+    lock_release(&filesys_lock);
     return ERROR;
   }
 
   off_t offset = file_tell(f);
-  lock_release(&sys_file_lock);
+  lock_release(&filesys_lock);
   return offset;
 }
 
-// Closes the file descriptor.
-void close(int file_index)
+
+void close(int fd)
 {
-  lock_acquire(&sys_file_lock);
-  process_close_file(file_index);
-  lock_release(&sys_file_lock);
+  lock_acquire(&filesys_lock);
+  process_close_file(fd);
+  lock_release(&filesys_lock);
 }
 
-// Checks whether the given virtual address is valid.
-// Done by making sure it is not null, that it is a user virtual address, 
-// and that it doesn't go the bottom of the defind vitural address bottom limit.
 void check_valid_ptr(const void *vaddr)
 {
-  if (vaddr == NULL || !is_user_vaddr(vaddr) || vaddr < USER_VADDR_BOTTOM)
+  for (int i=0; i<4; i++)
   {
-    exit(ERROR);
+    if (check_single_ptr_invalid((const void *) (vaddr + i)))
+    {
+      exit(ERROR);
+    }
   }
 }
 
-// Gets the kernel address of the user ptr.
+bool check_single_ptr_invalid(const void *ptr)
+{
+  return (!is_user_vaddr(ptr) || ptr < USER_VADDR_BOTTOM);
+}
+
 int user_to_kernel_ptr(const void *vaddr)
 {
   check_valid_ptr(vaddr);
@@ -338,7 +350,118 @@ int user_to_kernel_ptr(const void *vaddr)
   return (int) ptr;
 }
 
-// Gets the arguments passed in and checks each arg for validity.
+int process_add_file(struct file *f)
+{
+  struct process_file *pf = malloc(sizeof(struct process_file));
+
+  if(!pf)
+  {
+    return ERROR;
+  }
+
+  pf->file = f;
+  pf->fd = thread_current()->fd;
+  thread_current()->fd++;
+  list_push_back(&thread_current()->file_list, &pf->elem);
+  return pf->fd;
+}
+
+struct file* process_get_file(int fd)
+{
+  struct thread *t = thread_current();
+  struct list_elem *e;
+
+  for (e = list_begin(&t->file_list); e!= list_end(&t->file_list); e = list_next(e))
+  {
+    struct process_file *pf = list_entry(e, struct process_file, elem);
+    if (fd == pf->fd)
+    {
+      return pf->file;
+    } 
+  } 
+  return NULL;
+}
+
+void process_close_file(int fd)
+{
+  struct thread *t = thread_current();
+  struct list_elem *next, *e = list_begin(&t->file_list);
+  
+  while(e != list_end(&t->file_list))
+  {
+    next = list_next(e);
+    struct process_file *pf = list_entry(e, struct process_file, elem);
+    if(fd == pf->fd || fd == CLOSE_ALL)
+    {
+      file_close(pf->file);
+      list_remove(&pf->elem);
+      free(pf);
+      if(fd != CLOSE_ALL)
+      {
+        return;
+      }
+    }
+    e = next;
+  }
+}
+
+
+struct child_process* add_child_process(int pid)
+{
+  struct child_process* cp = malloc(sizeof(struct child_process));
+
+  if(!cp)
+  {
+    return NULL;
+  }
+
+  cp->pid = pid;
+  cp->load = NOT_LOADED;
+  cp->wait = false;
+  cp->exit = false;
+  sema_init(&cp->load_sema, 0);
+  sema_init(&cp->exit_sema, 0);
+  list_push_back(&thread_current()->child_list, &cp->elem);
+  return cp;
+}
+
+struct child_process* get_child_process(int pid)
+{
+  struct thread *t = thread_current();
+  struct list_elem *e;
+
+  for(e = list_begin(&t->child_list); e!=list_end(&t->child_list); e = list_next(e))
+  {
+    struct child_process *cp = list_entry(e, struct child_process, elem);
+    if (pid == cp->pid)
+    {
+      return cp;
+    }
+  }
+  return NULL;
+}
+
+void remove_child_process(struct child_process *cp)
+{
+  list_remove(&cp->elem);
+  free(cp);
+}
+
+void remove_child_processes(void)
+{
+  struct thread *t = thread_current();
+  struct list_elem *next, *e = list_begin(&t->child_list);
+
+  while(e != list_end(&t->child_list))
+  {
+    next = list_next(e);
+    struct child_process *cp = list_entry(e, struct child_process, elem);
+    list_remove(&cp->elem); // call remove_child_process
+    free(cp);
+    e = next;
+  }
+}
+
 void get_arg (struct intr_frame *f, int *arg, int n)
 {
   int *ptr;
@@ -346,21 +469,21 @@ void get_arg (struct intr_frame *f, int *arg, int n)
   {
     ptr = (int *) f->esp + i + 1;
     check_valid_ptr((const void *) ptr);
-    arg[i] = *(int *)ptr; // THIS RIGHT HERE IS FAILING
+    arg[i] = *ptr; // THIS RIGHT HERE IS FAILING
   }
 }
 
-// Checks buffer args for validity by checking each byte.
 void check_valid_buffer(void *buffer, unsigned size)
 {
   unsigned i;
+  char *local = (char *) buffer;
   for (i=0; i < size; i++)
   {
-    check_valid_ptr((const void*) (buffer + i));
+    check_valid_ptr((const void*) local);
+    local++;
   }
 }
 
-// Checks the validity of the given string.
 void check_valid_string (const void *str)
 {
   while (* (char *) user_to_kernel_ptr(str) != 0)
@@ -368,3 +491,4 @@ void check_valid_string (const void *str)
     str = (char *) str + 1;
   }
 }
+

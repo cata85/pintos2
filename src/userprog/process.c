@@ -17,16 +17,18 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
+#include "userprog/syscall.h"
 
 static thread_func start_process NO_RETURN;
-static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static bool load (const char *cmdline, void (**eip) (void), void **esp, char **saveptr);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
 tid_t
-process_execute (const char *file_name) 
+process_execute (const char *file_name)
 {
   char *fn_copy;
   tid_t tid;
@@ -38,10 +40,16 @@ process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
+  char *saveptr;
+  file_name = strtok_r((char *) file_name, " ", &saveptr);
+
   /* Create a new thread to execute FILE_NAME. */
   tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    palloc_free_page (fn_copy);
+
+
   return tid;
 }
 
@@ -54,16 +62,32 @@ start_process (void *file_name_)
   struct intr_frame if_;
   bool success;
 
+  char *saveptr;
+  file_name = strtok_r(file_name, " ", &saveptr);
+
+
+
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  success = load (file_name, &if_.eip, &if_.esp, &saveptr);
+
+  if (success)
+  {
+    thread_current()->cp->load_status = LOAD_SUCCESS;
+  }
+  else
+  {
+    thread_current()->cp->load_status = LOAD_FAIL;
+  }
+
+  sema_up(&thread_current()->cp->load_status_sema);
 
   /* If load failed, quit. */
   palloc_free_page (file_name);
-  if (!success) 
+  if (!success)
     thread_exit ();
 
   /* Start the user process by simulating a return from an
@@ -86,9 +110,25 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid UNUSED)
 {
-  return -1;
+  struct child_process *cp = get_child_process(child_tid);
+  if (!cp)
+  {
+    return ERROR;
+  }
+  if (cp->parent_waiting)
+  {
+    return ERROR;
+  }
+  cp->parent_waiting = true;
+  if (!cp->exit)
+  {
+    sema_down(&cp->exit_sema);
+  }
+  int status = cp->status;
+  remove_child_process(cp);
+  return status;
 }
 
 /* Free the current process's resources. */
@@ -98,10 +138,28 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+  lock_acquire(&sys_file_lock);
+  process_close_file(CLOSE_ALL);
+
+  if(cur->exec_file)
+  {
+    file_close(cur->exec_file);
+  }
+  lock_release(&sys_file_lock);
+
+  remove_child_processes();
+
+  if (is_process_alive(cur->parent) && cur->cp && cur->exec_file)
+  {
+    cur->cp->exit = true;
+    sema_up(&cur->cp->exit_sema);
+  }
+
+
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
-  if (pd != NULL) 
+  if (pd != NULL)
     {
       /* Correct ordering here is crucial.  We must set
          cur->pagedir to NULL before switching page directories,
@@ -195,7 +253,11 @@ struct Elf32_Phdr
 #define PF_W 2          /* Writable. */
 #define PF_R 4          /* Readable. */
 
-static bool setup_stack (void **esp);
+/* Used for setup_stack */
+#define WORD_SIZE 4
+#define DEFAULT_ARGV 2
+
+static bool setup_stack (void **esp, const char *filename, char **saveptr);
 static bool validate_segment (const struct Elf32_Phdr *, struct file *);
 static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
                           uint32_t read_bytes, uint32_t zero_bytes,
@@ -206,7 +268,7 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
    and its initial stack pointer into *ESP.
    Returns true if successful, false otherwise. */
 bool
-load (const char *file_name, void (**eip) (void), void **esp) 
+load (const char *file_name, void (**eip) (void), void **esp, char **saveptr)
 {
   struct thread *t = thread_current ();
   struct Elf32_Ehdr ehdr;
@@ -217,17 +279,21 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
-  if (t->pagedir == NULL) 
+  if (t->pagedir == NULL)
     goto done;
   process_activate ();
 
+  lock_acquire(&sys_file_lock);
   /* Open executable file. */
   file = filesys_open (file_name);
-  if (file == NULL) 
+  if (file == NULL)
     {
       printf ("load: %s: open failed\n", file_name);
-      goto done; 
+      goto done;
     }
+
+  file_deny_write(file);
+  t->exec_file = file;
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -236,15 +302,15 @@ load (const char *file_name, void (**eip) (void), void **esp)
       || ehdr.e_machine != 3
       || ehdr.e_version != 1
       || ehdr.e_phentsize != sizeof (struct Elf32_Phdr)
-      || ehdr.e_phnum > 1024) 
+      || ehdr.e_phnum > 1024)
     {
       printf ("load: %s: error loading executable\n", file_name);
-      goto done; 
+      goto done;
     }
 
   /* Read program headers. */
   file_ofs = ehdr.e_phoff;
-  for (i = 0; i < ehdr.e_phnum; i++) 
+  for (i = 0; i < ehdr.e_phnum; i++)
     {
       struct Elf32_Phdr phdr;
 
@@ -255,7 +321,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
       if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
         goto done;
       file_ofs += sizeof phdr;
-      switch (phdr.p_type) 
+      switch (phdr.p_type)
         {
         case PT_NULL:
         case PT_NOTE:
@@ -269,7 +335,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
         case PT_SHLIB:
           goto done;
         case PT_LOAD:
-          if (validate_segment (&phdr, file)) 
+          if (validate_segment (&phdr, file))
             {
               bool writable = (phdr.p_flags & PF_W) != 0;
               uint32_t file_page = phdr.p_offset & ~PGMASK;
@@ -284,7 +350,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
                   zero_bytes = (ROUND_UP (page_offset + phdr.p_memsz, PGSIZE)
                                 - read_bytes);
                 }
-              else 
+              else
                 {
                   /* Entirely zero.
                      Don't read anything from disk. */
@@ -302,7 +368,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
     }
 
   /* Set up stack. */
-  if (!setup_stack (esp))
+  if (!setup_stack (esp, file_name, saveptr))
     goto done;
 
   /* Start address. */
@@ -312,7 +378,9 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+
+  lock_release(&sys_file_lock);
+
   return success;
 }
 
@@ -323,24 +391,24 @@ static bool install_page (void *upage, void *kpage, bool writable);
 /* Checks whether PHDR describes a valid, loadable segment in
    FILE and returns true if so, false otherwise. */
 static bool
-validate_segment (const struct Elf32_Phdr *phdr, struct file *file) 
+validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
 {
   /* p_offset and p_vaddr must have the same page offset. */
-  if ((phdr->p_offset & PGMASK) != (phdr->p_vaddr & PGMASK)) 
-    return false; 
+  if ((phdr->p_offset & PGMASK) != (phdr->p_vaddr & PGMASK))
+    return false;
 
   /* p_offset must point within FILE. */
-  if (phdr->p_offset > (Elf32_Off) file_length (file)) 
+  if (phdr->p_offset > (Elf32_Off) file_length (file))
     return false;
 
   /* p_memsz must be at least as big as p_filesz. */
-  if (phdr->p_memsz < phdr->p_filesz) 
-    return false; 
+  if (phdr->p_memsz < phdr->p_filesz)
+    return false;
 
   /* The segment must not be empty. */
   if (phdr->p_memsz == 0)
     return false;
-  
+
   /* The virtual memory region must both start and end within the
      user address space range. */
   if (!is_user_vaddr ((void *) phdr->p_vaddr))
@@ -381,14 +449,14 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
    or disk read error occurs. */
 static bool
 load_segment (struct file *file, off_t ofs, uint8_t *upage,
-              uint32_t read_bytes, uint32_t zero_bytes, bool writable) 
+              uint32_t read_bytes, uint32_t zero_bytes, bool writable)
 {
   ASSERT ((read_bytes + zero_bytes) % PGSIZE == 0);
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
   file_seek (file, ofs);
-  while (read_bytes > 0 || zero_bytes > 0) 
+  while (read_bytes > 0 || zero_bytes > 0)
     {
       /* Calculate how to fill this page.
          We will read PAGE_READ_BYTES bytes from FILE
@@ -405,15 +473,15 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
         {
           palloc_free_page (kpage);
-          return false; 
+          return false;
         }
       memset (kpage + page_read_bytes, 0, page_zero_bytes);
 
       /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable)) 
+      if (!install_page (upage, kpage, writable))
         {
           palloc_free_page (kpage);
-          return false; 
+          return false;
         }
 
       /* Advance. */
@@ -427,20 +495,95 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
 static bool
-setup_stack (void **esp) 
+setup_stack (void **esp, const char *filename, char **saveptr)
 {
   uint8_t *kpage;
   bool success = false;
 
   kpage = palloc_get_page (PAL_USER | PAL_ZERO);
-  if (kpage != NULL) 
+  if (!kpage)
+  {
+    return success;
+  }
+
+  success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
+  if (success)
+  {
+    *esp = PHYS_BASE;
+  }
+  else
+  {
+    palloc_free_page (kpage);
+    return success;
+  }
+
+  char *token;
+  char **argv = malloc(DEFAULT_ARGV * sizeof(char *));
+  if(!argv)
+  {
+    return false;
+  }
+  int i, argc = 0, argv_size = DEFAULT_ARGV;
+
+  /*
+  Push args onto stack
+  */
+
+  for (token = (char *) filename; token != NULL; token = strtok_r(NULL, " ", saveptr))
+  {
+    // making space for arg size
+    *esp -= strlen(token) + 1;
+    // saving new address
+    argv[argc] = *esp;
+    // ready for next arg
+    argc++;
+
+    // Align to word size (4 bytes by default)
+    if (argc >= argv_size)
     {
-      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
-      if (success)
-        *esp = PHYS_BASE;
-      else
-        palloc_free_page (kpage);
+      argv_size *= 2;
+      argv = realloc(argv, argv_size*sizeof(char*));
+      if(!argv)
+      {
+        return false;
+      }
     }
+    // copy the arg from the filename to the stack
+    memcpy(*esp, token, strlen(token) + 1);
+  }
+  argv[argc] = 0;
+
+  // Align to word size (4 bytes)
+  i = (size_t) *esp % WORD_SIZE;
+  if (i)
+  {
+    *esp -= i;
+    memcpy(*esp, &argv[argc], i);
+  }
+
+  // Push argv[i] for all i
+  for (i = argc; i >= 0; i--)
+  {
+    *esp -= sizeof(char*);
+    memcpy(*esp, &argv[i], sizeof(char *));
+  }
+
+  // Push argv
+  token = *esp;
+  *esp -= sizeof(char *);
+  memcpy(*esp, &token, sizeof(char **));
+  // Push argc
+  *esp -= sizeof(int);
+  memcpy(*esp, &argc, sizeof(int));
+  // Push fake return address
+  *esp -= sizeof(void *);
+  memcpy(*esp, &argv[argc], sizeof(void *));
+  // free argv
+  free(argv);
+
+
+
+
   return success;
 }
 
@@ -463,3 +606,138 @@ install_page (void *upage, void *kpage, bool writable)
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
+
+/* Creates a new process file struct. It assigns the
+   file index from the thread and increments the file index in the
+   thread. It also adds the new process_file struct into the list*/
+int process_add_file(struct file *f)
+{
+  // new process_file struct
+  struct process_file *pf = malloc(sizeof(struct process_file));
+
+  if(!pf)
+  {
+    return ERROR;
+  }
+
+  pf->file = f;
+  // sets current file_index and the increments
+  pf->file_index = thread_current()->file_index;
+  thread_current()->file_index++;
+  // adds the new file to the file list in the thread
+  list_push_back(&thread_current()->file_list, &pf->elem);
+  // returns the new file_index for the file created
+  return pf->file_index;
+}
+
+/* finds the file that has the same file index in the 
+   list of files in the current thread, returns NULL 
+   if not found. */
+struct file* process_get_file(int file_index)
+{
+  struct thread *t = thread_current();
+  struct list_elem *e;
+  /* loop through the list of files in the current thread. Ones
+     we find a matching file_index, return the file* otherwise
+     returns NULL*/
+  for (e = list_begin(&t->file_list); e!= list_end(&t->file_list); e = list_next(e))
+  {
+    struct process_file *pf = list_entry(e, struct process_file, elem);
+    if (file_index == pf->file_index)
+    {
+      return pf->file;
+    }
+  }
+  return NULL;
+}
+
+/* finds the file in the list that has the corresponding
+   file index and it removes it from the file list in the
+   process. It also removes all files amrked as CLOSE_ALL.*/
+void process_close_file(int file_index)
+{
+  struct thread *t = thread_current();
+  struct list_elem *next, *e;
+
+  for(e = list_begin(&t->file_list); e != list_end(&t->file_list); e = next)
+  {
+    next = list_next(e);
+    struct process_file *pf = list_entry(e, struct process_file, elem);
+    if(file_index == pf->file_index || file_index == CLOSE_ALL)
+    {
+      file_close(pf->file);
+      list_remove(&pf->elem);
+      free(pf);
+      if(file_index != CLOSE_ALL)
+      {
+        return;
+      }
+    }
+  }
+}
+
+/* creates a child process and adds it to the current threads
+   child process list in struct thread.*/
+struct child_process* add_child_process(int pid)
+{
+  struct child_process* cp = malloc(sizeof(struct child_process));
+
+  if(!cp)
+  {
+    return NULL;
+  }
+
+  cp->pid = pid;
+  cp->load_status = NOT_LOADED;
+  cp->parent_waiting = false;
+  cp->exit = false;
+  sema_init(&cp->load_status_sema, 0);
+  sema_init(&cp->exit_sema, 0);
+  list_push_back(&thread_current()->child_list, &cp->elem);
+  return cp;
+}
+
+
+/* From the list of child processes in the current thread, and given
+   a process id, it returns a pointer to the child process. */
+struct child_process* get_child_process(int pid)
+{
+  struct thread *t = thread_current();
+  struct list_elem *e;
+
+  for(e = list_begin(&t->child_list); e!=list_end(&t->child_list); e = list_next(e))
+  {
+    struct child_process *cp = list_entry(e, struct child_process, elem);
+    if (pid == cp->pid)
+    {
+      return cp;
+    }
+  }
+  return NULL;
+}
+
+
+/* given a child process, it removes the child process from the list
+   it belongs to and free the space in memory */
+void remove_child_process(struct child_process *cp)
+{
+  list_remove(&cp->elem);
+  free(cp);
+}
+
+/* it loops through all the the child processes in the current 
+   thread and deletes all of them */
+void remove_child_processes(void)
+{
+  struct thread *t = thread_current();
+  struct list_elem *next, *e = list_begin(&t->child_list);
+
+  while(e != list_end(&t->child_list))
+  {
+    next = list_next(e);
+    struct child_process *cp = list_entry(e, struct child_process, elem);
+    remove_child_process(cp); 
+    e = next;
+  }
+}
+
